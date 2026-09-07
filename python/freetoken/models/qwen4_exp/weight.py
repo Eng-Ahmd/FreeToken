@@ -1,4 +1,4 @@
-"""Qwen3.8-Flash-Next (RadixArk NVFP4) checkpoint reader.
+"""Qwen3.8-Flash-Next NVFP4 checkpoint reader (RadixArk repack + official nvidia).
 
 Three separate paths, because the checkpoint's three weight classes live in different places:
 

@@ -104,6 +104,37 @@ def _ignored(patterns, module_name: str) -> bool:
     return any(fnmatch(module_name, pat) for pat in patterns)
 
 
+def _is_nvfp4_experts(get, algo: str) -> bool:
+    """Whether the routed experts are NVFP4.
+
+    Plain NVFP4 builds tag the top-level ``quant_algo`` (RadixArk: ``NVFP4``);
+    modelopt ``MIXED_PRECISION`` (nvidia/Qwen3.8-Flash-Next-NVFP4) mixes 4-bit
+    experts with bf16 dense and only labels the experts per-layer in
+    ``quantized_layers`` / ``config_groups``.
+    """
+    if "fp4" in algo:
+        return True
+    if "mixed" not in algo:
+        return False
+    layers = get("quantized_layers") or {}
+    if isinstance(layers, dict):
+        for name, spec in layers.items():
+            if ".mlp.experts" in str(name):
+                if "fp4" in str((spec or {}).get("quant_algo", "")).lower():
+                    return True
+    groups = get("config_groups") or {}
+    if isinstance(groups, dict):
+        for group in groups.values():
+            targets = (group or {}).get("targets") or []
+            if any("mlp.experts" in str(t) for t in targets):
+                weights = (group or {}).get("weights") or {}
+                if int(weights.get("num_bits", 0) or 0) == 4 and str(
+                    weights.get("type", "")
+                ).lower() == "float":
+                    return True
+    return False
+
+
 def _layer_types(text: Any) -> list[str]:
     layer_types = getattr(text, "layer_types", None)
     if layer_types is not None:
@@ -149,6 +180,12 @@ def parse_config(hf_config: Any) -> ModelConfig:
         else {k: v for k, v in rope_params.items() if not isinstance(v, (list, dict))}
     )
 
+    # Layer split first: self_attn exists only on full_attention layers (layer 0
+    # is linear/GDN here), so the attn probe below must land on a real owner.
+    layer_types = _layer_types(text)
+    full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
+    linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
+
     get = _quant_get(hf_config)
     if get is None:
         expert_quant = attn_quant = dense_quant = lm_head_quant = "none"
@@ -164,24 +201,46 @@ def parse_config(hf_config: Any) -> ModelConfig:
             expert_quant = "fp8_block"
             attn_quant = dense_quant = lm_head_quant = "none"
         else:
-            is_fp4 = "fp4" in algo
+            is_fp4 = _is_nvfp4_experts(get, algo)
             ignore = list(get("ignore") or [])
 
-            # The RadixArk NVFP4 build quantizes only the routed experts; attention/GDN,
-            # the shared expert, HC, PLE and lm_head all sit in the modelopt ignore list
-            # and stay bf16. Derive every flag from that list instead of assuming the split.
+            # NVFP4 builds quantize only the routed experts; attention/GDN, the
+            # shared expert, HC, PLE and lm_head all sit in the modelopt ignore
+            # list and stay bf16. Derive every flag from that list instead of
+            # assuming the split. This covers both the RadixArk repack
+            # (top-level NVFP4, wildcard ignores) and the official nvidia
+            # checkpoint (MIXED_PRECISION, per-layer qualified ignores).
             def _quant(probe: str) -> str:
                 return "nvfp4" if is_fp4 and not _ignored(ignore, probe) else "none"
 
             prefix = "model.language_model.layers.0"
             expert_quant = _quant(f"{prefix}.mlp.experts.0.gate_proj")
             dense_quant = _quant(f"{prefix}.mlp.shared_expert.gate_proj")
-            attn_quant = _quant(f"{prefix}.self_attn.q_proj")
+            # self_attn lives only on full layers and linear_attn only on linear
+            # ones; attn_quant drives the GDN out_proj today (QSA stays bf16), so
+            # either side quantized keeps the NVFP4 kernels. Empty groups are
+            # vacuously ignored so a hypothetical all-linear/all-full config
+            # cannot misroute on a nonexistent probe.
+            if full_ids:
+                full_probe = (
+                    f"model.language_model.layers.{full_ids[0]}.self_attn.q_proj"
+                )
+                self_ignored = _ignored(ignore, full_probe)
+            else:
+                self_ignored = True
+            if linear_ids:
+                linear_probe = (
+                    f"model.language_model.layers.{linear_ids[0]}.linear_attn.out_proj"
+                )
+                linear_ignored = _ignored(ignore, linear_probe)
+            else:
+                linear_ignored = True
+            attn_quant = (
+                "nvfp4"
+                if is_fp4 and not (self_ignored and linear_ignored)
+                else "none"
+            )
             lm_head_quant = _quant("lm_head")
-
-    layer_types = _layer_types(text)
-    full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
-    linear_ids = tuple(i for i, t in enumerate(layer_types) if t == "linear_attention")
 
     # HF stores ple_layer_ids one-indexed (validated upstream as [1, num_layers]).
     ple_layer_ids = tuple(int(i) - 1 for i in (getattr(text, "ple_layer_ids", None) or ()))
