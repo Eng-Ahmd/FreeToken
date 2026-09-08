@@ -153,11 +153,12 @@ def _is_gemma_norm(name: str) -> bool:
 
 
 def _try_fuse(
-    name: str, tensor: torch.Tensor, buf: dict[str, dict[int, torch.Tensor]]
+    name: str, tensor: torch.Tensor, buf: dict[str, dict[int, torch.Tensor]],
+    fusions: dict[str, tuple[str, ...]] | None = None,
 ) -> tuple[str, torch.Tensor] | tuple[()] | None:
     """buffer a fusion part; return merged ``(name, tensor)`` once all parts arrive,
     ``()`` while incomplete, ``None`` if not a fusion part."""
-    for fused_suffix, parts in _FUSIONS.items():
+    for fused_suffix, parts in (fusions if fusions is not None else _FUSIONS).items():
         for idx, part in enumerate(parts):
             if name.endswith(part):
                 key = name[: -len(part)] + fused_suffix
@@ -218,8 +219,16 @@ def iter_weights(
     # dequantizing to bf16. lm_head here is bf16 (pure NVFP4 doesn't quantize it).
     dense_nvfp4 = config.dense_quant == "nvfp4"
     lmhead_nvfp4 = config.lm_head_quant == "nvfp4"
+    # ModelOpt plain-NVFP4 dense (attn_quant=="nvfp4" outside the compressed-tensors
+    # path, which returns earlier): the attention/GDN linears are NVFP4 too -- keep them
+    # native instead of dequantizing to bf16 below.
+    attn_nvfp4_native = config.attn_quant == "nvfp4"
     shared_buf: dict[str, dict[str, torch.Tensor]] = {}
     nvfp4_shared_buf: dict[str, dict[str, tuple]] = {}
+    nvfp4_attn_buf: dict[str, dict[int, tuple]] = {}
+    # Plain-NVFP4 GDN split: qkv|z stay native NVFP4 (above) while the excluded b|a
+    # stay bf16 and fuse 2-way into in_proj_ba (the model's _nvfp4 split, same as fp8).
+    ba_buf: dict[str, dict[int, torch.Tensor]] = {}
     fuse_buf: dict[str, dict[int, torch.Tensor]] = {}
 
     for file in tqdm(
@@ -251,16 +260,25 @@ def iter_weights(
 
                 # NVFP4 dense projections kept native (W4A16) where the model expects them
                 # (shared_expert); everything else dequantizes to bf16 below as before.
-                if (dense_nvfp4 or lmhead_nvfp4) and name.endswith(".weight") \
+                if name.endswith(".weight") \
                         and raw_name[: -len(".weight")] + ".weight_scale_2" in keyset:
-                    emit = _dense_nvfp4_emit(
-                        f, name[: -len(".weight")], raw_name[: -len(".weight")],
-                        shared_nvfp4=dense_nvfp4, lmhead_nvfp4=lmhead_nvfp4,
-                        shared_buf=nvfp4_shared_buf,
-                    )
-                    if emit is not _NOT_DENSE_NVFP4:
-                        yield from emit
-                        continue
+                    if dense_nvfp4 or lmhead_nvfp4:
+                        emit = _dense_nvfp4_emit(
+                            f, name[: -len(".weight")], raw_name[: -len(".weight")],
+                            shared_nvfp4=dense_nvfp4, lmhead_nvfp4=lmhead_nvfp4,
+                            shared_buf=nvfp4_shared_buf,
+                        )
+                        if emit is not _NOT_DENSE_NVFP4:
+                            yield from emit
+                            continue
+                    if attn_nvfp4_native:
+                        emit = _attn_nvfp4_emit(
+                            f, name[: -len(".weight")], raw_name[: -len(".weight")],
+                            buf=nvfp4_attn_buf,
+                        )
+                        if emit is not _NOT_ATTN_NVFP4:
+                            yield from emit
+                            continue
 
                 tensor = _load_maybe_quantized(f, raw_name, keyset)
 
@@ -276,6 +294,14 @@ def iter_weights(
                     continue
 
                 # fuse q/k/v -> qkv_proj and GDN in_proj_{qkv,z,b,a} -> in_proj
+                # (plain-NVFP4: b|a fuse 2-way into in_proj_ba; qkv|z left as native
+                # NVFP4 in_proj_qkvz above and must not enter the 4-way bf16 fusion)
+                if attn_nvfp4_native:
+                    ba = _try_fuse(name, tensor, ba_buf, _NVFP4_BF16_FUSE)
+                    if ba is not None:
+                        if ba != ():  # () means buffered, not yet complete
+                            yield ba
+                        continue
                 fused = _try_fuse(name, tensor, fuse_buf)
                 if fused is not None:
                     if fused != ():  # () means buffered, not yet complete
@@ -289,7 +315,66 @@ def iter_weights(
 
     assert not shared_buf, f"Incomplete shared-expert merges: {list(shared_buf.keys())}"
     assert not nvfp4_shared_buf, f"Incomplete NVFP4 shared-expert merges: {list(nvfp4_shared_buf.keys())}"
+    assert not nvfp4_attn_buf, f"Incomplete NVFP4 attention fusions: {list(nvfp4_attn_buf.keys())}"
+    assert not ba_buf, f"Incomplete NVFP4 in_proj_ba fusions: {list(ba_buf.keys())}"
     assert not fuse_buf, f"Incomplete projection fusions: {list(fuse_buf.keys())}"
+
+
+# ======================================================================================
+# Native-NVFP4 attention (modelopt plain-NVFP4 dense, attn_quant == "nvfp4")
+# ======================================================================================
+# Fused projections, concatenated on the output dim in the order the model splits them
+# (q|k|v, GDN qkv|z); each part keeps its own block scales + per-row global, so the
+# fused FP4 weight is exact. Standalone (o_proj, GDN out_proj) pass through as triples.
+_NVFP4_ATTN_FUSE: dict[str, tuple[str, ...]] = {
+    ".self_attn.qkv_proj": (
+        ".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj",
+    ),
+    ".linear_attn.in_proj_qkvz": (
+        ".linear_attn.in_proj_qkv", ".linear_attn.in_proj_z",
+    ),
+}
+_NVFP4_ATTN_SINGLE = (".self_attn.o_proj", ".linear_attn.out_proj")
+
+# bf16 survivors under plain-NVFP4 (the excluded GDN b|a): 2-way fusion into the
+# model's in_proj_ba input (matches the fp8 portrait in _PT_BF16_FUSE).
+_NVFP4_BF16_FUSE: dict[str, tuple[str, ...]] = {
+    ".linear_attn.in_proj_ba.weight": (
+        ".linear_attn.in_proj_b.weight", ".linear_attn.in_proj_a.weight",
+    ),
+}
+
+# Sentinel: ``base`` is not a native-NVFP4 attention projection (caller dequantizes).
+_NOT_ATTN_NVFP4 = object()
+
+
+def _attn_nvfp4_emit(f, base: str, raw_base: str, *, buf: dict):
+    """For a dense attention ``.weight`` with a ``weight_scale_2`` (NVFP4), return the
+    native-W4A16 ``(key, tensor)`` list -- ``.weight`` (uint8) + ``.weight_scale`` (fp8
+    block) + ``.weight_global`` (fp16 per-row) -- for standalone projections, or the
+    output-dim-concatenated triple once all fusion parts arrive (``[]`` while buffered).
+    Returns ``_NOT_ATTN_NVFP4`` when the model does not keep this layer native."""
+    if any(base.endswith(single) for single in _NVFP4_ATTN_SINGLE):
+        w, s, g = _nvfp4_parts(f, raw_base)
+        return [(base + ".weight", w), (base + ".weight_scale", s), (base + ".weight_global", g)]
+    for fused_suffix, parts in _NVFP4_ATTN_FUSE.items():
+        for idx, part in enumerate(parts):
+            if base.endswith(part):
+                slots = buf.setdefault(base[: -len(part)] + fused_suffix, {})
+                slots[idx] = _nvfp4_parts(f, raw_base)
+                if len(slots) < len(parts):
+                    return []
+                key = base[: -len(part)] + fused_suffix
+                del buf[key]
+                ws = [slots[i][0] for i in range(len(parts))]
+                ss = [slots[i][1] for i in range(len(parts))]
+                gs = [slots[i][2] for i in range(len(parts))]
+                return [
+                    (key + ".weight", torch.cat(ws, dim=0)),
+                    (key + ".weight_scale", torch.cat(ss, dim=0)),
+                    (key + ".weight_global", torch.cat(gs, dim=0)),
+                ]
+    return _NOT_ATTN_NVFP4
 
 
 # ======================================================================================

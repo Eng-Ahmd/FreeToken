@@ -68,6 +68,39 @@ def _expert_quant(hf_config: Any) -> str:
 _compressed_tensors_nvfp4 = detect_compressed_tensors_nvfp4
 
 
+def _modelopt_plain_nvfp4(hf_config: Any) -> bool:
+    """Plain ModelOpt NVFP4 (e.g. gittensor Qwen3.8-27B-NVFP4-RTX5090): top-level
+    ``quant_algo`` NVFP4 with no per-layer ``quantized_layers`` map (unlike the
+    MIXED_PRECISION checkpoints) and not compressed-tensors. Storage is the ModelOpt
+    layout (``.weight`` uint8 + ``.weight_scale`` + ``.weight_scale_2``) on every
+    Linear outside ``exclude_modules``/``ignore``."""
+    if _compressed_tensors_nvfp4(hf_config):
+        return False
+    get = _quant_accessor(hf_config)
+    if get is None:
+        return False
+    algo = str(get("quant_algo") or get("quant_method") or "").lower()
+    if "fp4" not in algo:
+        return False
+    layers = get("quantized_layers")
+    return not isinstance(layers, dict) or len(layers) == 0
+
+
+def _module_excluded(hf_config: Any, suffix: str) -> bool:
+    """Whether a plain-NVFP4 exclusion list keeps ``suffix`` in bf16. Producers spell
+    the list as ``exclude_modules`` (gittensor) or ``ignore`` (other ModelOpt
+    exports); entries are dotted prefixes, so match on the trailing module path."""
+    get = _quant_accessor(hf_config)
+    if get is None:
+        return False
+    excluded: list = []
+    for key in ("exclude_modules", "ignore"):
+        entries = get(key) or []
+        if isinstance(entries, (list, tuple)):
+            excluded.extend(entries)
+    return any(str(e).rstrip("*").rstrip(".").endswith(suffix) for e in excluded)
+
+
 def _lm_head_quant(hf_config: Any) -> str:
     """Whether the checkpoint stores ``lm_head`` as NVFP4. modelopt MIXED_PRECISION lists it in
     the per-layer ``quantized_layers`` map (``W4A16_NVFP4``); pure-NVFP4 checkpoints have no
@@ -191,6 +224,15 @@ def parse_config(hf_config: Any) -> ModelConfig:
     # the dense Qwen3_5DenseMLP instead of the MoE block.
     num_experts = getattr(text, "num_experts", 0) or 0
     moe_enabled = num_experts > 0
+
+    # ModelOpt plain-NVFP4 *dense* checkpoints (gittensor Qwen3.8-27B-NVFP4-RTX5090):
+    # every Linear outside the exclusion list is NVFP4, so the attention/GDN linears
+    # stay native W4A16 instead of dequantizing to bf16 at load. The moe_enabled gate
+    # keeps every MoE checkpoint on its existing path byte-identically.
+    if not moe_enabled and _modelopt_plain_nvfp4(hf_config):
+        attn_quant = "nvfp4"
+        if not _module_excluded(hf_config, "lm_head"):
+            lm_head_quant = "nvfp4"
 
     layer_types = _layer_types(text)
     full_ids = tuple(i for i, t in enumerate(layer_types) if t == "full_attention")
