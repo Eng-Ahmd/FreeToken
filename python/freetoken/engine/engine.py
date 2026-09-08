@@ -268,6 +268,26 @@ def _make_dummy_weight_state_dict(
     return state_dict
 
 
+def _pin_host_embed(weight: torch.Tensor) -> torch.Tensor | None:
+    """Pin the embedding table in host RAM for a zero-copy (UVA) gather at lookup:
+    only looked-up rows cross PCIe (~10KB/token), saving ~2.5GB of VRAM at ~10us of
+    gather time per step on sm_120. Accepts GPU or host input. Returns the pinned
+    table, or None when pinning is unavailable (no built extension / no CUDA
+    context), in which case the caller keeps the table on the GPU."""
+    try:
+        from freetoken.kernel.pinned import alloc_pinned_tensor
+    except ImportError:
+        return None
+    try:
+        pinned = alloc_pinned_tensor(*weight.shape, dtype=weight.dtype)
+    except RuntimeError:
+        logger.warning("host embedding pin failed; keeping embed_tokens on the GPU")
+        return None
+    with torch.no_grad():
+        pinned.copy_(weight)
+    return pinned
+
+
 def _materialize_loaded_weight_state_dict(
     model_state: Dict[str, torch.Tensor],
     weights: Iterable[Tuple[str, torch.Tensor]],
@@ -277,7 +297,13 @@ def _materialize_loaded_weight_state_dict(
     state_dict: Dict[str, torch.Tensor] = {}
     for key, weight in weights:
         expected = model_state.get(key)
-        if expected is None:
+        if (
+            key == "model.embed_tokens.weight"
+            and (expected is None or weight.dtype == expected.dtype)
+            and (pinned := _pin_host_embed(weight)) is not None
+        ):
+            state_dict[key] = pinned
+        elif expected is None:
             state_dict[key] = weight.to(device=device)
         else:
             state_dict[key] = weight.to(device=device, dtype=expected.dtype)

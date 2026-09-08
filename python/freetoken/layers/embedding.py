@@ -40,11 +40,20 @@ class VocabParallelEmbedding(BaseOP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from freetoken.kernel import indexing
 
-        y = indexing(
-            weights=self.weight,
-            indices=x,
-            vocab_range=self.vocab_range if self.tp_size > 1 else None,
-        )
+        if not self.weight.is_cuda and self.tp_size == 1:
+            # Host-pinned table (qwen3_5_moe loader keeps embed_tokens off the GPU):
+            # the TVM indexing kernel needs same-device tensors, so gather zero-copy
+            # (UVA) through the Triton kernel instead. Fixed shapes/pointers, no host
+            # sync: CUDA-graph safe.
+            from freetoken.kernel.triton.embed_gather import embed_gather_host
+
+            y = embed_gather_host(self.weight, x)
+        else:
+            y = indexing(
+                weights=self.weight,
+                indices=x,
+                vocab_range=self.vocab_range if self.tp_size > 1 else None,
+            )
 
         if self.tp_size > 1:
             y = self._comm.all_reduce(y)
