@@ -197,7 +197,7 @@ def _report(results: list[dict], out: str, key: str) -> None:
     passed = sum(1 for r in done if r.get(key) is True)
     wall = sum(r.get("wall_s", 0) for r in done)
     toks = sum(r.get("completion_tokens", 0) for r in done)
-    fails = [str(r.get("task_id", r.get("idx"))) for r in done if r.get(key) is not True][:10]
+    fails = [str(r.get("task_id", r.get("id", r.get("idx")))) for r in done if r.get(key) is not True][:10]
     print(f"\n{key}: {passed}/{len(done)} ({100 * passed / max(1, len(done)):.1f}%)  "
           f"{toks / max(wall, 1e-9):.1f} tok/s over {wall:.0f}s -> {out}")
     if fails:
