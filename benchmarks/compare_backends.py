@@ -96,10 +96,11 @@ PROMPTS: list[dict] = [
 ]
 
 
-def _post(url: str, payload: dict, timeout: int = 600) -> dict:
-    req = urllib.request.Request(
-        url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}
-    )
+def _post(url: str, payload: dict, timeout: int = 600, api_key: str | None = None) -> dict:
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
@@ -115,8 +116,16 @@ def _split_thinking(message: dict) -> tuple[str, str]:
     return reasoning, content
 
 
+def _strip_fences(text: str) -> str:
+    """Remove ```lang fences some servers leave around code/JSON answers."""
+    text = text.strip()
+    m = re.fullmatch(r"```(?:\w+)?\s*\n?(.*?)```", text, re.DOTALL)
+    return m.group(1).strip() if m else text
+
+
 def _exec_check(code: str, call: str, expect) -> tuple[bool, str]:
     """Run model code with a neutered builtins set and compare one expression."""
+    code = _strip_fences(code)
     safe_builtins = {"range": range, "len": len, "min": min, "max": max}
     env: dict = {"__builtins__": safe_builtins}
     try:
@@ -127,7 +136,7 @@ def _exec_check(code: str, call: str, expect) -> tuple[bool, str]:
     return (got == expect, f"got {got!r}, want {expect!r}")
 
 
-def run_one(base_url: str, model: str, prompt: dict) -> dict:
+def run_one(base_url: str, model: str, prompt: dict, api_key: str | None = None) -> dict:
     payload = {
         "model": model,
         "messages": prompt["messages"],
@@ -136,7 +145,7 @@ def run_one(base_url: str, model: str, prompt: dict) -> dict:
     }
     t0 = time.perf_counter()
     try:
-        data = _post(f"{base_url}/chat/completions", payload)
+        data = _post(f"{base_url}/chat/completions", payload, api_key=api_key)
     except Exception as exc:  # noqa: BLE001
         return {"id": prompt["id"], "error": f"{type(exc).__name__}: {exc}"}
     wall = time.perf_counter() - t0
@@ -155,7 +164,7 @@ def run_one(base_url: str, model: str, prompt: dict) -> dict:
     if "json_check" in prompt:
         spec = prompt["json_check"]
         try:
-            parsed = json.loads(content.strip().removeprefix("```json").removesuffix("```").strip())
+            parsed = json.loads(_strip_fences(content))
             checks["json"] = parsed.get(spec["key"]) == spec["expect"]
         except Exception as exc:  # noqa: BLE001
             checks["json"] = f"parse failed: {exc}"
@@ -184,6 +193,7 @@ def main() -> int:
     ap.add_argument("--base-url", required=True, help="e.g. http://127.0.0.1:1919/v1")
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", required=True, help="results JSONL path")
+    ap.add_argument("--api-key", default=None, help="Bearer token if the server needs one")
     ap.add_argument("--only", default=None, help="comma-separated prompt ids to run")
     ns = ap.parse_args()
 
@@ -193,7 +203,7 @@ def main() -> int:
         if only and prompt["id"] not in only:
             continue
         print(f"[{prompt['id']}] ...", flush=True)
-        results.append(run_one(ns.base_url.rstrip("/"), ns.model, prompt))
+        results.append(run_one(ns.base_url.rstrip("/"), ns.model, prompt, api_key=ns.api_key))
 
     ok = sum(
         1
