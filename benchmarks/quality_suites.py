@@ -36,6 +36,18 @@ _SAFE_BUILTINS = {
     "tuple": tuple, "ValueError": ValueError, "Exception": Exception,
 }
 
+LIVE = False
+
+
+def _live_print(label: str, r: dict) -> None:
+    """Echo the full LLM interaction for --live watching."""
+    if not LIVE:
+        return
+    print(f"--- {label} think ---", flush=True)
+    print(r.get("reasoning") or "(empty)", flush=True)
+    print(f"--- {label} answer [{r.get('finish_reason')}] ---", flush=True)
+    print(r.get("content") or "(empty)", flush=True)
+
 
 def _complete(base_url: str, model: str, messages: list, max_tokens: int,
               api_key: str | None, think_budget: int = 0,
@@ -110,6 +122,7 @@ def run_humaneval(base_url: str, model: str, api_key: str | None, out: str,
         code = _strip_fences(r["content"]) or _strip_fences(r["reasoning"])
         program = code + "\n" + task["test"]
         ok, detail = _run_untrusted(program)
+        _live_print(task["task_id"], r)
         # Canonical HumanEval entry point check lives in task["entry_point"]; the
         # test body already calls it, so a clean run == pass.
         results.append({"task_id": task["task_id"], "pass": ok, "detail": detail, **r})
@@ -152,6 +165,7 @@ def run_gsm8k(base_url: str, model: str, api_key: str | None, out: str,
             ok = pred is not None and abs(float(pred) - float(gold)) < 1e-6
         except ValueError:
             ok = False
+        _live_print(f"gsm8k-{offset + i}", r)
         results.append({"idx": offset + i, "pass": ok, "gold": gold, "pred": pred, **r})
     _report(results, out, key="pass")
 
@@ -166,6 +180,13 @@ def _load_aime() -> list[dict]:
     return items
 
 
+def _load_aime2026() -> list[dict]:
+    with open(os.path.join(DATADIR, "aime2026.json"), encoding="utf-8") as fh:
+        rows = json.load(fh)
+    return [{"id": f"26-{r['problem_idx']}", "question": r["problem"],
+             "answer": r["answer"]} for r in rows]
+
+
 def _aime_gold(answer) -> int | None:
     """Gold answers carry LaTeX (e.g. '336^\\circ'): take the first integer."""
     m = re.search(r"-?\d+", str(answer).replace(",", ""))
@@ -173,8 +194,9 @@ def _aime_gold(answer) -> int | None:
 
 
 def run_aime(base_url: str, model: str, api_key: str | None, out: str,
-             think_budget: int = 0, answer_budget: int = 1024) -> None:
-    items = _load_aime()
+             think_budget: int = 0, answer_budget: int = 1024,
+             problems: list[dict] | None = None) -> None:
+    items = problems if problems is not None else _load_aime()
     results = []
     for i, item in enumerate(items):
         print(f"[{i + 1}/{len(items)}] {item['id']} ...", flush=True)
@@ -192,6 +214,7 @@ def run_aime(base_url: str, model: str, api_key: str | None, out: str,
             ok = gold is not None and pred is not None and int(float(pred)) == gold
         except ValueError:
             ok = False
+        _live_print(item["id"], r)
         results.append({"id": item["id"], "pass": ok, "gold": gold, "pred": pred,
                         "nudged": r.get("nudged", False), **r})
     _report(results, out, key="pass")
@@ -217,7 +240,8 @@ def _report(results: list[dict], out: str, key: str) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--suite", required=True, choices=["humaneval", "gsm8k", "aime"])
+    ap.add_argument("--suite", required=True,
+                    choices=["humaneval", "gsm8k", "aime", "aime2026"])
     ap.add_argument("--base-url", required=True)
     ap.add_argument("--model", required=True)
     ap.add_argument("--api-key", default=None)
@@ -228,12 +252,19 @@ def main() -> int:
                     help="cap think tokens (0 = single call); overflow nudges the model to answer")
     ap.add_argument("--answer-budget", type=int, default=1024,
                     help="max tokens for the post-nudge answer")
+    ap.add_argument("--live", action="store_true",
+                    help="print every full LLM response to the console as it completes")
     ns = ap.parse_args()
+    global LIVE
+    LIVE = ns.live
     if ns.suite == "humaneval":
         run_humaneval(ns.base_url.rstrip("/"), ns.model, ns.api_key, ns.out, ns.limit)
     elif ns.suite == "aime":
         run_aime(ns.base_url.rstrip("/"), ns.model, ns.api_key, ns.out,
                  ns.think_budget, ns.answer_budget)
+    elif ns.suite == "aime2026":
+        run_aime(ns.base_url.rstrip("/"), ns.model, ns.api_key, ns.out,
+                 ns.think_budget, ns.answer_budget, problems=_load_aime2026())
     else:
         run_gsm8k(ns.base_url.rstrip("/"), ns.model, ns.api_key, ns.out, ns.limit, ns.offset)
     return 0
