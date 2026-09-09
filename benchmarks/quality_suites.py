@@ -38,7 +38,16 @@ _SAFE_BUILTINS = {
 
 
 def _complete(base_url: str, model: str, messages: list, max_tokens: int,
-              api_key: str | None) -> dict:
+              api_key: str | None, think_budget: int = 0,
+              answer_budget: int = 1024) -> dict:
+    if think_budget > 0:
+        from thinking_budget import complete_with_budget
+
+        t0 = time.perf_counter()
+        r = complete_with_budget(base_url, model, messages, think_budget,
+                                 answer_budget, api_key)
+        r["wall_s"] = round(time.perf_counter() - t0, 3)
+        return r
     payload = {"model": model, "messages": messages, "temperature": 0.0,
                "max_tokens": max_tokens}
     t0 = time.perf_counter()
@@ -163,7 +172,8 @@ def _aime_gold(answer) -> int | None:
     return int(m.group(0)) if m else None
 
 
-def run_aime(base_url: str, model: str, api_key: str | None, out: str) -> None:
+def run_aime(base_url: str, model: str, api_key: str | None, out: str,
+             think_budget: int = 0, answer_budget: int = 1024) -> None:
     items = _load_aime()
     results = []
     for i, item in enumerate(items):
@@ -171,7 +181,7 @@ def run_aime(base_url: str, model: str, api_key: str | None, out: str) -> None:
         r = _complete(
             base_url, model,
             [{"role": "user", "content": item["question"] + "\nReply with only the integer answer (0-999)."}],
-            2048, api_key,
+            2048, api_key, think_budget, answer_budget,
         )
         if "error" in r:
             results.append({"id": item["id"], **r})
@@ -182,7 +192,8 @@ def run_aime(base_url: str, model: str, api_key: str | None, out: str) -> None:
             ok = gold is not None and pred is not None and int(float(pred)) == gold
         except ValueError:
             ok = False
-        results.append({"id": item["id"], "pass": ok, "gold": gold, "pred": pred, **r})
+        results.append({"id": item["id"], "pass": ok, "gold": gold, "pred": pred,
+                        "nudged": r.get("nudged", False), **r})
     _report(results, out, key="pass")
 
 
@@ -213,11 +224,16 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--offset", type=int, default=0)
+    ap.add_argument("--think-budget", type=int, default=0,
+                    help="cap think tokens (0 = single call); overflow nudges the model to answer")
+    ap.add_argument("--answer-budget", type=int, default=1024,
+                    help="max tokens for the post-nudge answer")
     ns = ap.parse_args()
     if ns.suite == "humaneval":
         run_humaneval(ns.base_url.rstrip("/"), ns.model, ns.api_key, ns.out, ns.limit)
     elif ns.suite == "aime":
-        run_aime(ns.base_url.rstrip("/"), ns.model, ns.api_key, ns.out)
+        run_aime(ns.base_url.rstrip("/"), ns.model, ns.api_key, ns.out,
+                 ns.think_budget, ns.answer_budget)
     else:
         run_gsm8k(ns.base_url.rstrip("/"), ns.model, ns.api_key, ns.out, ns.limit, ns.offset)
     return 0
